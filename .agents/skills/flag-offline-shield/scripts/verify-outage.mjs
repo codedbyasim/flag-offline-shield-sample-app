@@ -3,22 +3,33 @@
  * verify-outage.mjs
  * Portable standalone outage resilience verification script bundled with flag-offline-shield.
  *
- * Requires zero test framework or repo-specific npm scripts.
+ * Requires `--src <path>` and `--snapshot <path>`.
  * Verifies:
- *   1. Snapshot file is valid non-empty Flagsmith JS state ({ api, flags }).
- *   2. Positive control: against a local mock SDK HTTP server, `flagsmith/isomorphic`
+ *   1. App code AST check (`--src`): fails non-zero if `--src` does not exist, scans 0 files,
+ *      or contains ANY Flagsmith SDK init lacking offline defaults (defaultFlags/state/serverState/defaultFlagHandler).
+ *   2. Snapshot file is valid non-empty Flagsmith JS state ({ api, flags }).
+ *   3. Positive control: against a local mock SDK HTTP server, `flagsmith/isomorphic`
  *      hits `/api/v1/flags/` over HTTP and returns live server values (source: SERVER).
- *   3. Outage test (against http://127.0.0.1:1/api/v1/ or --outage-url):
+ *   4. Outage check (against http://127.0.0.1:1/api/v1/ or --outage-url):
  *      - Unprotected client (no defaultFlags) fails with a real network error (NOT XMLHttpRequest)
  *        and reports source: NONE with empty flags.
  *      - Shielded client (with defaultFlags from --snapshot) catches the real network error,
  *        reports source: DEFAULT_FLAGS, and serves every flag's exact baked enabled & value.
+ *
+ * Explicitly states in output what is NOT covered (`notCovered`).
  */
 
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { scanCodebase } from "./check-drift.mjs";
+
+const NOT_COVERED = [
+  "Does not execute your application's own runtime functions, React rendering, or business logic (pair with an app-level outage smoke test).",
+  "Does not verify server-side Flagsmith SDKs (Node local evaluation, Python, Go, etc.) or browser localStorage cache persistence.",
+  "Does not verify semantic correctness of fallback values or dynamically computed flag keys.",
+];
 
 function loadFlagsmithIsomorphic() {
   const candidates = [
@@ -45,6 +56,7 @@ const getArg = (flag, fallback = null) => {
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : fallback;
 };
 
+const srcArg = getArg("--src", null);
 const snapshotPath = path.resolve(
   process.cwd(),
   getArg("--snapshot", "./public/flags.json")
@@ -139,6 +151,45 @@ function buildControlPayload(flagsMap) {
 }
 
 async function run() {
+  // 0. Require --src and verify app code has zero unprotected SDK inits
+  if (!srcArg) {
+    console.error(
+      "Error: --src <path> is required so verify-outage.mjs checks your application's SDK initializations."
+    );
+    process.exit(1);
+  }
+
+  const resolvedSrc = path.resolve(process.cwd(), srcArg);
+  if (!fs.existsSync(resolvedSrc)) {
+    console.error(`Error: --src path does not exist: ${srcArg}`);
+    process.exit(1);
+  }
+
+  const codeScan = scanCodebase(resolvedSrc);
+  if (codeScan.scannedFiles === 0) {
+    console.error(`Error: --src path scanned 0 JS/TS source files: ${srcArg}`);
+    process.exit(1);
+  }
+
+  const appCodeScan = {
+    srcPath: path.relative(process.cwd(), resolvedSrc).split(path.sep).join("/") || ".",
+    scannedFiles: codeScan.scannedFiles,
+    totalInits: codeScan.totalInits,
+    unprotectedInits: codeScan.unprotectedInits,
+  };
+
+  if (codeScan.unprotectedInits.length > 0) {
+    const failureReport = {
+      passed: false,
+      reason: `Found ${codeScan.unprotectedInits.length} Flagsmith SDK init(s) in ${appCodeScan.srcPath} lacking offline defaults.`,
+      appCodeScan,
+      notCovered: NOT_COVERED,
+    };
+    console.log(JSON.stringify(failureReport, null, 2));
+    console.error(`Error: ${failureReport.reason}`);
+    process.exit(1);
+  }
+
   const { createFlagsmithInstance } = loadFlagsmithIsomorphic();
   const snapshot = loadAndValidateSnapshot(snapshotPath);
   const defaultFlags = buildDefaultFlags(snapshot.flags);
@@ -303,6 +354,7 @@ async function run() {
         passed: true,
         snapshotPath: path.relative(process.cwd(), snapshotPath).split(path.sep).join("/"),
         flagCount: flagNames.length,
+        appCodeScan,
         positiveControl: controlSummary,
         unprotectedOutage: {
           apiUrl: outageUrl,
@@ -316,6 +368,7 @@ async function run() {
           networkError: shieldedErrMsg,
           flagsVerified: flagNames.length,
         },
+        notCovered: NOT_COVERED,
       },
       null,
       2

@@ -7,11 +7,14 @@ class CartStore {
   }
 }
 
-export async function loadCheckoutFlags(environmentID: string) {
+export async function loadCheckoutFlags(
+  environmentID: string,
+  api = "https://edge.api.flagsmith.com/api/v1/"
+) {
   const client = createFlagsmithInstance();
   await client.init({
     environmentID,
-    api: "https://edge.api.flagsmith.com/api/v1/",
+    api,
     cacheFlags: false,
   });
 

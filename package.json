@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && node test/outage-smoke.mjs"
   },
   "dependencies": {
     "flagsmith": "^9.3.5"

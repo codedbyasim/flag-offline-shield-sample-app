@@ -20,6 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 function loadTypeScript() {
   const candidates = [
@@ -55,11 +56,11 @@ const jqExpr = "[.[] | {name: .feature, enabled, value}]";
 
 const FLAGSMITH_MODULE_RE = /^(@flagsmith\/)?flagsmith(\/|$)|^flagsmith-nodejs$/;
 const FLAGSMITH_TYPE_NAMES = new Set(["IFlagsmith", "Flagsmith"]);
+const BOOLEAN_FLAG_METHODS = new Set(["hasFeature", "isFeatureEnabled"]);
+const VALUE_FLAG_METHODS = new Set(["getValue", "getFeatureValue"]);
 const FLAG_READ_METHODS = new Set([
-  "hasFeature",
-  "getValue",
-  "isFeatureEnabled",
-  "getFeatureValue",
+  ...BOOLEAN_FLAG_METHODS,
+  ...VALUE_FLAG_METHODS,
 ]);
 const OFFLINE_DEFAULT_KEYS = new Set([
   "defaultFlags",
@@ -1180,6 +1181,12 @@ function scanSingleFile(filePath, sourceFile, projectIndex) {
           }
         } else if (FLAG_READ_METHODS.has(methodName) && isFlagsmithReceiver(receiver)) {
           totalCalls += 1;
+          // hasFeature() / isFeatureEnabled() always return a boolean (false when absent),
+          // so they are never nullish/unprotected in `if`, `&&`, `!`, or standalone use.
+          // Use `{ fallback: true }` only when a feature should intentionally fail open.
+          if (BOOLEAN_FLAG_METHODS.has(methodName)) {
+            return;
+          }
           const flagName = getStringLiteralValue(node.arguments[0]);
           const hasFallback =
             isWrappedInInlineFallback(node) ||
@@ -1207,7 +1214,7 @@ function scanSingleFile(filePath, sourceFile, projectIndex) {
   return { totalInits, totalCalls, unprotectedInits, unprotectedCalls };
 }
 
-function scanCodebase(dir) {
+export function scanCodebase(dir) {
   const filePaths = collectSourceFiles(dir);
   const parsedFiles = filePaths.map((filePath) => {
     const content = fs.readFileSync(filePath, "utf8");
@@ -1295,35 +1302,56 @@ function computeDrift(liveFlags, snapshot) {
   return { inSync, drift };
 }
 
-let liveResult;
-try {
-  liveResult = loadLiveFlags();
-} catch (err) {
-  console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
+function runCli() {
+  const resolvedSrc = path.resolve(process.cwd(), srcDir);
+  if (!fs.existsSync(resolvedSrc)) {
+    console.error(`Error: --src path does not exist: ${srcDir}`);
+    process.exit(1);
+  }
+
+  const scan = scanCodebase(resolvedSrc);
+  if (scan.scannedFiles === 0) {
+    console.error(`Error: --src scanned 0 JS/TS source files: ${srcDir}`);
+    process.exit(1);
+  }
+
+  let liveResult;
+  try {
+    liveResult = loadLiveFlags();
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  const snapshot = loadSnapshot(snapshotPath);
+  const { inSync, drift } = computeDrift(liveResult.flags, snapshot);
+
+  const report = {
+    source: liveResult.source,
+    snapshotPath: toPosixRelative(path.resolve(snapshotPath)),
+    snapshotExists: Boolean(snapshot),
+    summary: {
+      liveFlags: liveResult.flags.length,
+      inSync,
+      drifted: drift.length,
+      scannedFiles: scan.scannedFiles,
+      totalInits: scan.totalInits,
+      unprotectedInits: scan.unprotectedInits.length,
+      totalCalls: scan.totalCalls,
+      unprotectedCalls: scan.unprotectedCalls.length,
+    },
+    drift,
+    unprotectedInits: scan.unprotectedInits,
+    unprotectedCalls: scan.unprotectedCalls,
+  };
+
+  console.log(JSON.stringify(report, null, 2));
 }
 
-const snapshot = loadSnapshot(snapshotPath);
-const scan = scanCodebase(srcDir);
-const { inSync, drift } = computeDrift(liveResult.flags, snapshot);
+const isDirectRun =
+  process.argv[1] &&
+  pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 
-const report = {
-  source: liveResult.source,
-  snapshotPath: toPosixRelative(path.resolve(snapshotPath)),
-  snapshotExists: Boolean(snapshot),
-  summary: {
-    liveFlags: liveResult.flags.length,
-    inSync,
-    drifted: drift.length,
-    scannedFiles: scan.scannedFiles,
-    totalInits: scan.totalInits,
-    unprotectedInits: scan.unprotectedInits.length,
-    totalCalls: scan.totalCalls,
-    unprotectedCalls: scan.unprotectedCalls.length,
-  },
-  drift,
-  unprotectedInits: scan.unprotectedInits,
-  unprotectedCalls: scan.unprotectedCalls,
-};
-
-console.log(JSON.stringify(report, null, 2));
+if (isDirectRun) {
+  runCli();
+}
