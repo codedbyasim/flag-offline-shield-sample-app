@@ -1,17 +1,17 @@
 {
   "api": "https://edge.api.flagsmith.com/api/v1/",
   "flags": {
+    "ai_checkout_assistant": {
+      "enabled": true,
+      "value": null
+    },
     "checkout_promo_banner": {
-      "enabled": false,
-      "value": "EXPIRED10"
+      "enabled": true,
+      "value": "FLASH20"
     },
     "promo_discount_pct": {
       "enabled": true,
-      "value": 10
-    },
-    "legacy_holiday_banner": {
-      "enabled": true,
-      "value": "WINTER5"
+      "value": 20
     }
   }
 }
