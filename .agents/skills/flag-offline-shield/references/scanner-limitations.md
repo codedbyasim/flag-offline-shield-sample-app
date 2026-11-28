@@ -15,6 +15,6 @@
 - **Semantic correctness:** Checks presence of offline defaults/fallbacks, not whether chosen fallback values are appropriate for business logic.
 
 ## Outage Check (`scripts/verify-outage.mjs`) — What Is NOT Covered
-- Does not execute the target app's own runtime functions, React component tree, or business logic (pair with an app-level outage smoke test that invokes your own loader/component against `http://127.0.0.1:1/api/v1/`).
+- Does not execute the target app's own runtime functions, React component tree, or business logic (pair with an app-level outage smoke test that invokes your own loader/component against `http://127.0.0.1:59999/api/v1/`).
 - Does not test server-side Flagsmith SDKs (Node local evaluation, Python, Go, etc.) or browser `localStorage` caching.
 - Does not verify semantic correctness of fallback values or runtime-computed flag keys.

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { loadCheckoutFlags } from "../dist/checkout.js";
 
-const OUTAGE_API_URL = "http://127.0.0.1:1/api/v1/";
+const OUTAGE_API_URL = "http://127.0.0.1:59999/api/v1/";
 const snapshotPath = path.resolve(process.cwd(), "public", "flags.json");
 const snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
 

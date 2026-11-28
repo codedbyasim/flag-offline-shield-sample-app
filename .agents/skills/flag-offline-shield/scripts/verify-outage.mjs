@@ -10,7 +10,7 @@
  *   2. Snapshot file is valid non-empty Flagsmith JS state ({ api, flags }).
  *   3. Positive control: against a local mock SDK HTTP server, `flagsmith/isomorphic`
  *      hits `/api/v1/flags/` over HTTP and returns live server values (source: SERVER).
- *   4. Outage check (against http://127.0.0.1:1/api/v1/ or --outage-url):
+ *   4. Outage check (against http://127.0.0.1:59999/api/v1/ or --outage-url):
  *      - Unprotected client (no defaultFlags) fails with a real network error (NOT XMLHttpRequest)
  *        and reports source: NONE with empty flags.
  *      - Shielded client (with defaultFlags from --snapshot) catches the real network error,
@@ -63,7 +63,7 @@ const snapshotPath = path.resolve(
 );
 const outageUrl = getArg(
   "--outage-url",
-  process.env.FLAGSMITH_OUTAGE_TEST_URL || "http://127.0.0.1:1/api/v1/"
+  process.env.FLAGSMITH_OUTAGE_TEST_URL || "http://127.0.0.1:59999/api/v1/"
 );
 const envKey = getArg("--env-key", "offline-shield-verify");
 
@@ -300,6 +300,10 @@ async function run() {
     `Got XMLHttpRequest error instead of real network error: ${unprotectedErrMsg}`
   );
   assert(
+    !/bad port/i.test(unprotectedErrMsg),
+    `Got blocked-port error instead of connection error: ${unprotectedErrMsg}`
+  );
+  assert(
     unprotectedClient.loadingState?.source === "NONE",
     `Unprotected outage expected sdkSource "NONE", got "${unprotectedClient.loadingState?.source}"`
   );
@@ -338,6 +342,10 @@ async function run() {
   assert(
     !/XMLHttpRequest/i.test(shieldedErrMsg),
     `Got XMLHttpRequest error instead of real network error: ${shieldedErrMsg}`
+  );
+  assert(
+    !/bad port/i.test(shieldedErrMsg),
+    `Got blocked-port error instead of connection error: ${shieldedErrMsg}`
   );
   assert(
     shieldedClient.loadingState?.source === "DEFAULT_FLAGS",

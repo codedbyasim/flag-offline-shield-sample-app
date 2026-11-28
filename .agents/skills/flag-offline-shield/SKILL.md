@@ -10,7 +10,7 @@ Resolve `SKILL_DIR` to the folder containing this `SKILL.md`. All paths below ar
 - `@flagsmith/cli` v2+ (`npm install -g @flagsmith/cli`), authenticated (`flagsmith login` or `FLAGSMITH_API_KEY`), bound via `flagsmith init` (`flagsmith.json`)
 - Node.js 18+, `typescript` (for AST scan), `flagsmith` v9+ with `flagsmith/isomorphic` (for outage check)
 - `git`, GitHub CLI `gh` (`gh auth login`), optional `bash` (only for `scripts/audit-flags.sh`)
-- **URL rules:** `FLAGSMITH_API_URL` (`--api-url`) and `FLAGSMITH_SDK_API_URL` (`--sdk-api-url`, used by `eval`) take base URLs **without** `/api/v1/`. The JS SDK `api` option **requires** `/api/v1/`. Optional `FLAGSMITH_OUTAGE_TEST_URL` overrides `http://127.0.0.1:1/api/v1/`.
+- **URL rules:** `FLAGSMITH_API_URL` (`--api-url`) and `FLAGSMITH_SDK_API_URL` (`--sdk-api-url`, used by `eval`) take base URLs **without** `/api/v1/`. The JS SDK `api` option **requires** `/api/v1/`. Optional `FLAGSMITH_OUTAGE_TEST_URL` overrides `http://127.0.0.1:59999/api/v1/`.
 
 ## Mandatory Safety & Token Rules
 1. **Low-token CLI only:** Always run `flagsmith flag list --json --jq '[.[] | {name: .feature, enabled, value}]'` (or `scripts/audit-flags.sh` / `scripts/check-drift.mjs`). Never dump unfiltered CLI JSON into context.
