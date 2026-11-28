@@ -7,6 +7,11 @@
 - **Cross-file init config objects:** Only inline object literals and same-file `const` object literals are inspected for `defaultFlags`, `state`, `serverState`, `defaultFlagHandler`, or `offlineHandler`.
 - **Non-JS/TS SDKs:** Only `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, and `.cjs` files are scanned (not Python, Go, Java, Ruby, etc.).
 - **Boolean intent on `hasFeature()`:** `hasFeature()` / `isFeatureEnabled()` always return a `boolean` (`false` when absent) so they are not flagged as unprotected; the scanner cannot know whether a specific feature should fail open (`{ fallback: true }`) vs. fail closed (`false`).
+- **`init()` rejection handling gaps:**
+  - Fire-and-forget `client.init({ defaultFlags });` statements (neither awaited nor returned and with no `.catch()`) are not flagged, even though they can trigger an `unhandledRejection` event in Node.
+  - Promises stored in a variable and awaited/handled later (e.g., `const p = client.init({ defaultFlags }); await p;`) or passed to `Promise.all([...])` are not tracked across assignments.
+  - Rejections handled in an outer caller of a function that returns `client.init(...)` are conservatively flagged at the `return` site.
+  - Any `throw` statement inside a `catch` block (even conditional) is conservatively treated as rethrowing.
 - **Semantic correctness:** Checks presence of offline defaults/fallbacks, not whether chosen fallback values are appropriate for business logic.
 
 ## Outage Check (`scripts/verify-outage.mjs`) — What Is NOT Covered

@@ -400,6 +400,197 @@ function optionsHasExplicitFallback(expr, localConstObjects) {
   return false;
 }
 
+function blockContainsThrow(node) {
+  if (!node) return false;
+  let foundThrow = false;
+
+  const visitBlock = (n) => {
+    if (foundThrow) return;
+    if (ts.isThrowStatement(n)) {
+      foundThrow = true;
+      return;
+    }
+    // Do not descend into nested functions/classes
+    if (
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isClassDeclaration(n) ||
+      ts.isClassExpression(n)
+    ) {
+      return;
+    }
+    // If a nested try/catch catches its own throw without rethrowing, ignore throws inside its tryBlock
+    if (
+      ts.isTryStatement(n) &&
+      n.catchClause &&
+      !blockContainsThrow(n.catchClause.block)
+    ) {
+      if (n.finallyBlock) visitBlock(n.finallyBlock);
+      return;
+    }
+    ts.forEachChild(n, visitBlock);
+  };
+
+  visitBlock(node);
+  return foundThrow;
+}
+
+function isHandlingCallback(expr) {
+  if (!expr) return false;
+  const unwrapped = unwrapExpr(expr);
+  if (
+    unwrapped.kind === ts.SyntaxKind.NullKeyword ||
+    unwrapped.kind === ts.SyntaxKind.UndefinedKeyword ||
+    (ts.isIdentifier(unwrapped) && unwrapped.text === "undefined")
+  ) {
+    return false;
+  }
+  if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) {
+    if (ts.isBlock(unwrapped.body)) {
+      return !blockContainsThrow(unwrapped.body);
+    }
+    return true;
+  }
+  // Named handler function reference (e.g. `.catch(handleInitError)`)
+  return true;
+}
+
+/**
+ * Checks whether a Flagsmith `init()` call is awaited or returned without
+ * non-rethrowing rejection handling (`.catch(...)` or enclosing `try/catch`).
+ */
+function checkInitRejectionHandling(initCallNode) {
+  // 1. Walk up through promise chain (.then / .catch / .finally) and transparent wrappers
+  let chainTop = initCallNode;
+  let hasNonRethrowingCatch = false;
+
+  while (chainTop.parent) {
+    const p = chainTop.parent;
+    if (
+      ts.isParenthesizedExpression(p) ||
+      ts.isAsExpression(p) ||
+      ts.isTypeAssertionExpression(p) ||
+      ts.isNonNullExpression(p) ||
+      ts.isSatisfiesExpression(p)
+    ) {
+      chainTop = p;
+      continue;
+    }
+    if (
+      ts.isPropertyAccessExpression(p) &&
+      p.expression === chainTop &&
+      p.parent &&
+      ts.isCallExpression(p.parent) &&
+      p.parent.expression === p
+    ) {
+      const chainedCall = p.parent;
+      const method = p.name.text;
+      if (method === "catch") {
+        if (isHandlingCallback(chainedCall.arguments[0])) {
+          hasNonRethrowingCatch = true;
+        }
+        chainTop = chainedCall;
+        continue;
+      }
+      if (method === "then") {
+        if (
+          chainedCall.arguments.length >= 2 &&
+          isHandlingCallback(chainedCall.arguments[1])
+        ) {
+          hasNonRethrowingCatch = true;
+        }
+        chainTop = chainedCall;
+        continue;
+      }
+      if (method === "finally") {
+        chainTop = chainedCall;
+        continue;
+      }
+    }
+    break;
+  }
+
+  if (hasNonRethrowingCatch) {
+    return { ok: true };
+  }
+
+  // 2. Determine if `chainTop` is awaited or returned (stopping at function boundaries)
+  let isAwaited = false;
+  let isReturned = false;
+  let awaitNode = null;
+
+  let curr = chainTop;
+  while (curr.parent) {
+    const p = curr.parent;
+    if (
+      ts.isParenthesizedExpression(p) ||
+      ts.isAsExpression(p) ||
+      ts.isTypeAssertionExpression(p) ||
+      ts.isNonNullExpression(p) ||
+      ts.isSatisfiesExpression(p)
+    ) {
+      curr = p;
+      continue;
+    }
+    if (ts.isAwaitExpression(p) && p.expression === curr) {
+      isAwaited = true;
+      awaitNode = p;
+      break;
+    }
+    if (ts.isReturnStatement(p) && p.expression === curr) {
+      isReturned = true;
+      break;
+    }
+    if (ts.isArrowFunction(p) && p.body === curr) {
+      isReturned = true;
+      break;
+    }
+    break;
+  }
+
+  if (!isAwaited && !isReturned) {
+    return { ok: true };
+  }
+
+  // A returned Promise without `await` and without `.catch()` is NOT caught by an enclosing sync try/catch
+  if (isReturned && !isAwaited) {
+    return {
+      ok: false,
+      reason:
+        "returned init() has no .catch() handler (flagsmith/isomorphic rejects on network failure even with defaultFlags)",
+    };
+  }
+
+  // 3. For awaited init(), walk up within the SAME function scope for a TryStatement with a non-rethrowing catchClause
+  let walker = awaitNode;
+  while (walker && walker.parent) {
+    const p = walker.parent;
+    if (
+      ts.isFunctionDeclaration(p) ||
+      ts.isFunctionExpression(p) ||
+      ts.isArrowFunction(p) ||
+      ts.isMethodDeclaration(p) ||
+      ts.isSourceFile(p)
+    ) {
+      break;
+    }
+    if (ts.isTryStatement(p) && p.tryBlock === walker) {
+      if (p.catchClause && !blockContainsThrow(p.catchClause.block)) {
+        return { ok: true };
+      }
+    }
+    walker = p;
+  }
+
+  return {
+    ok: false,
+    reason:
+      "awaited init() has no non-rethrowing try/catch or .catch() handler (flagsmith/isomorphic rejects on network failure even with defaultFlags)",
+  };
+}
+
 function isWrappedInInlineFallback(node) {
   let curr = node;
   let parent = node.parent;
@@ -1171,12 +1362,21 @@ function scanSingleFile(filePath, sourceFile, projectIndex) {
           totalInits += 1;
           const configArg = node.arguments[0];
           const hasDefaults = objectHasOfflineDefaults(configArg, localConstObjects);
-          if (!hasDefaults) {
+          const rejectionCheck = checkInitRejectionHandling(node);
+
+          if (!hasDefaults || !rejectionCheck.ok) {
+            const reasons = [];
+            if (!hasDefaults) {
+              reasons.push("missing defaultFlags or state in init() config");
+            }
+            if (!rejectionCheck.ok) {
+              reasons.push(rejectionCheck.reason);
+            }
             unprotectedInits.push({
               file: relFile,
               line: getLineNumber(sourceFile, node),
               init: `${receiver.getText(sourceFile)}.init()`,
-              reason: "missing defaultFlags or state in init() config",
+              reason: reasons.join("; "),
             });
           }
         } else if (FLAG_READ_METHODS.has(methodName) && isFlagsmithReceiver(receiver)) {

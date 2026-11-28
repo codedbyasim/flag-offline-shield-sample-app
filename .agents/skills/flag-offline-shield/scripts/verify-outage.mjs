@@ -178,6 +178,18 @@ async function run() {
     unprotectedInits: codeScan.unprotectedInits,
   };
 
+  if (codeScan.totalInits === 0) {
+    const failureReport = {
+      passed: false,
+      reason: `Found 0 Flagsmith SDK inits in ${appCodeScan.srcPath}; verify --src points to your Flagsmith application source.`,
+      appCodeScan,
+      notCovered: NOT_COVERED,
+    };
+    console.log(JSON.stringify(failureReport, null, 2));
+    console.error(`Error: ${failureReport.reason}`);
+    process.exit(1);
+  }
+
   if (codeScan.unprotectedInits.length > 0) {
     const failureReport = {
       passed: false,
