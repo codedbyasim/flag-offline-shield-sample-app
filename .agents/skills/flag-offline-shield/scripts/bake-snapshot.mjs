@@ -132,17 +132,13 @@ function main() {
   fs.renameSync(tempPath, outPath);
 
   console.log(
-    JSON.stringify(
-      {
-        ok: true,
-        snapshotPath: path.relative(process.cwd(), outPath).split(path.sep).join("/"),
-        api: parsed.api ?? null,
-        flagCount: flagNames.length,
-        flags: flagNames,
-      },
-      null,
-      2
-    )
+    JSON.stringify({
+      ok: true,
+      snapshotPath: path.relative(process.cwd(), outPath).split(path.sep).join("/"),
+      api: parsed.api ?? null,
+      flagCount: flagNames.length,
+      flags: flagNames,
+    })
   );
 }
 

@@ -6,27 +6,29 @@
  * Requires `--src <path>` and `--snapshot <path>`.
  * Verifies:
  *   1. App code AST check (`--src`): fails non-zero if `--src` does not exist, scans 0 files,
- *      or contains ANY Flagsmith SDK init lacking offline defaults (defaultFlags/state/serverState/defaultFlagHandler).
+ *      has 0 Flagsmith SDK inits, or has any unprotected inits, unprotected calls,
+ *      uncovered flags, or unverified items.
  *   2. Snapshot file is valid non-empty Flagsmith JS state ({ api, flags }).
  *   3. Positive control: against a local mock SDK HTTP server, `flagsmith/isomorphic`
  *      hits `/api/v1/flags/` over HTTP and returns live server values (source: SERVER).
  *   4. Outage check (against http://127.0.0.1:59999/api/v1/ or --outage-url):
- *      - Unprotected client (no defaultFlags) fails with a real network error (NOT XMLHttpRequest)
+ *      - Unprotected client (no defaultFlags) fails with a real network error
  *        and reports source: NONE with empty flags.
  *      - Shielded client (with defaultFlags from --snapshot) catches the real network error,
  *        reports source: DEFAULT_FLAGS, and serves every flag's exact baked enabled & value.
- *
- * Explicitly states in output what is NOT covered (`notCovered`).
+ *   5. Optional `--smoke "<command>"`: executes the target app's own outage test with
+ *      `FLAGSMITH_OUTAGE_URL` set to the outage endpoint and sets `appRuntime`.
  */
 
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { scanCodebase } from "./check-drift.mjs";
+import { scanCodebase, computeUncoveredFlags } from "./check-drift.mjs";
 
 const NOT_COVERED = [
-  "Does not execute your application's own runtime functions, React rendering, or business logic (pair with an app-level outage smoke test).",
+  "Does not execute your application's own runtime functions, React rendering, or business logic unless --smoke is supplied.",
   "Does not verify server-side Flagsmith SDKs (Node local evaluation, Python, Go, etc.) or browser localStorage cache persistence.",
   "Does not verify semantic correctness of fallback values or dynamically computed flag keys.",
 ];
@@ -63,9 +65,13 @@ const snapshotPath = path.resolve(
 );
 const outageUrl = getArg(
   "--outage-url",
-  process.env.FLAGSMITH_OUTAGE_TEST_URL || "http://127.0.0.1:59999/api/v1/"
+  process.env.FLAGSMITH_OUTAGE_URL ||
+    process.env.FLAGSMITH_OUTAGE_TEST_URL ||
+    "http://127.0.0.1:59999/api/v1/"
 );
 const envKey = getArg("--env-key", "offline-shield-verify");
+const smokeCmd = getArg("--smoke", null);
+const verboseOutput = args.includes("--verbose");
 
 function assert(condition, message) {
   if (!condition) {
@@ -150,8 +156,35 @@ function buildControlPayload(flagsMap) {
   return { expected, wireFlags };
 }
 
+function buildStaticFailureReason(srcLabel, codeScan, uncoveredFlags) {
+  const parts = [];
+  if (codeScan.unprotectedInits.length > 0) {
+    const codes = Array.from(
+      new Set(codeScan.unprotectedInits.flatMap((i) => i.reasons ?? []))
+    );
+    parts.push(
+      `${codeScan.unprotectedInits.length} unprotected init(s)${
+        codes.length > 0 ? ` (${codes.join(", ")})` : ""
+      }`
+    );
+  }
+  if (codeScan.unprotectedCalls.length > 0) {
+    parts.push(`${codeScan.unprotectedCalls.length} unprotected flag call(s)`);
+  }
+  if (uncoveredFlags.length > 0) {
+    parts.push(
+      `${uncoveredFlags.length} uncovered flag(s) (${uncoveredFlags
+        .map((f) => f.name)
+        .join(", ")})`
+    );
+  }
+  if (codeScan.unverified.length > 0) {
+    parts.push(`${codeScan.unverified.length} unverified item(s)`);
+  }
+  return `Static check failed in ${srcLabel}: ${parts.join("; ")}.`;
+}
+
 async function run() {
-  // 0. Require --src and verify app code has zero unprotected SDK inits
   if (!srcArg) {
     console.error(
       "Error: --src <path> is required so verify-outage.mjs checks your application's SDK initializations."
@@ -171,39 +204,67 @@ async function run() {
     process.exit(1);
   }
 
-  const appCodeScan = {
-    srcPath: path.relative(process.cwd(), resolvedSrc).split(path.sep).join("/") || ".",
-    scannedFiles: codeScan.scannedFiles,
-    totalInits: codeScan.totalInits,
-    unprotectedInits: codeScan.unprotectedInits,
-  };
+  const srcRel = path.relative(process.cwd(), resolvedSrc).split(path.sep).join("/") || ".";
 
   if (codeScan.totalInits === 0) {
+    const appCodeScan = {
+      srcPath: srcRel,
+      scannedFiles: codeScan.scannedFiles,
+      totalInits: codeScan.totalInits,
+      unprotectedInits: codeScan.unprotectedInits,
+      totalCalls: codeScan.totalCalls,
+      unprotectedCalls: codeScan.unprotectedCalls,
+      uncoveredFlags: [],
+      unverified: codeScan.unverified,
+    };
     const failureReport = {
       passed: false,
-      reason: `Found 0 Flagsmith SDK inits in ${appCodeScan.srcPath}; verify --src points to your Flagsmith application source.`,
+      sdkAndStaticCheck: "failed",
+      appRuntime: "not_run",
+      reason: `Found 0 Flagsmith SDK inits in ${srcRel}; verify --src points to your Flagsmith application source.`,
       appCodeScan,
-      notCovered: NOT_COVERED,
+      ...(verboseOutput ? { notCovered: NOT_COVERED } : {}),
     };
-    console.log(JSON.stringify(failureReport, null, 2));
+    console.log(verboseOutput ? JSON.stringify(failureReport, null, 2) : JSON.stringify(failureReport));
     console.error(`Error: ${failureReport.reason}`);
     process.exit(1);
   }
 
-  if (codeScan.unprotectedInits.length > 0) {
+  const snapshot = loadAndValidateSnapshot(snapshotPath);
+  const uncoveredFlags = computeUncoveredFlags(codeScan, snapshot);
+
+  const appCodeScan = {
+    srcPath: srcRel,
+    scannedFiles: codeScan.scannedFiles,
+    totalInits: codeScan.totalInits,
+    unprotectedInits: codeScan.unprotectedInits,
+    totalCalls: codeScan.totalCalls,
+    unprotectedCalls: codeScan.unprotectedCalls,
+    uncoveredFlags,
+    unverified: codeScan.unverified,
+  };
+
+  if (
+    codeScan.unprotectedInits.length > 0 ||
+    codeScan.unprotectedCalls.length > 0 ||
+    uncoveredFlags.length > 0 ||
+    codeScan.unverified.length > 0
+  ) {
+    const reason = buildStaticFailureReason(srcRel, codeScan, uncoveredFlags);
     const failureReport = {
       passed: false,
-      reason: `Found ${codeScan.unprotectedInits.length} Flagsmith SDK init(s) in ${appCodeScan.srcPath} lacking offline defaults.`,
+      sdkAndStaticCheck: "failed",
+      appRuntime: "not_run",
+      reason,
       appCodeScan,
-      notCovered: NOT_COVERED,
+      ...(verboseOutput ? { notCovered: NOT_COVERED } : {}),
     };
-    console.log(JSON.stringify(failureReport, null, 2));
-    console.error(`Error: ${failureReport.reason}`);
+    console.log(verboseOutput ? JSON.stringify(failureReport, null, 2) : JSON.stringify(failureReport));
+    console.error(`Error: ${reason}`);
     process.exit(1);
   }
 
   const { createFlagsmithInstance } = loadFlagsmithIsomorphic();
-  const snapshot = loadAndValidateSnapshot(snapshotPath);
   const defaultFlags = buildDefaultFlags(snapshot.flags);
   const flagNames = Object.keys(defaultFlags);
   const { expected: controlExpected, wireFlags } = buildControlPayload(snapshot.flags);
@@ -368,32 +429,72 @@ async function run() {
     );
   }
 
-  console.log(
-    JSON.stringify(
-      {
-        passed: true,
-        snapshotPath: path.relative(process.cwd(), snapshotPath).split(path.sep).join("/"),
-        flagCount: flagNames.length,
-        appCodeScan,
-        positiveControl: controlSummary,
-        unprotectedOutage: {
-          apiUrl: outageUrl,
-          sdkSource: unprotectedClient.loadingState.source,
-          networkError: unprotectedErrMsg,
-          flagsReturned: Object.keys(unprotectedClient.getAllFlags() ?? {}).length,
-        },
-        shieldedOutage: {
-          apiUrl: outageUrl,
-          sdkSource: shieldedClient.loadingState.source,
-          networkError: shieldedErrMsg,
-          flagsVerified: flagNames.length,
-        },
-        notCovered: NOT_COVERED,
-      },
-      null,
-      2
-    )
-  );
+  // 4. Optional app-level outage smoke test
+  let appRuntime = "not_run";
+  let smokeResult = undefined;
+  let smokeFailed = false;
+  let smokeFailureReason = undefined;
+
+  if (smokeCmd) {
+    const res = spawnSync(smokeCmd, {
+      cwd: process.cwd(),
+      env: { ...process.env, FLAGSMITH_OUTAGE_URL: outageUrl },
+      shell: true,
+      encoding: "utf8",
+      timeout: 120000,
+    });
+    if (res.error || res.status !== 0) {
+      appRuntime = "failed";
+      smokeFailed = true;
+      const errSnippet = (res.stderr || res.stdout || res.error?.message || "")
+        .trim()
+        .slice(-400);
+      smokeFailureReason = `App outage smoke command exited with code ${res.status ?? 1}`;
+      smokeResult = {
+        command: smokeCmd,
+        exitCode: res.status ?? 1,
+        ...(errSnippet ? { error: errSnippet } : {}),
+      };
+    } else {
+      appRuntime = "passed";
+      smokeResult = {
+        command: smokeCmd,
+        exitCode: 0,
+      };
+    }
+  }
+
+  const report = {
+    passed: !smokeFailed,
+    sdkAndStaticCheck: "passed",
+    appRuntime,
+    ...(smokeFailureReason ? { reason: smokeFailureReason } : {}),
+    snapshotPath: path.relative(process.cwd(), snapshotPath).split(path.sep).join("/"),
+    flagCount: flagNames.length,
+    appCodeScan,
+    positiveControl: controlSummary,
+    unprotectedOutage: {
+      apiUrl: outageUrl,
+      sdkSource: unprotectedClient.loadingState.source,
+      networkError: unprotectedErrMsg,
+      flagsReturned: Object.keys(unprotectedClient.getAllFlags() ?? {}).length,
+    },
+    shieldedOutage: {
+      apiUrl: outageUrl,
+      sdkSource: shieldedClient.loadingState.source,
+      networkError: shieldedErrMsg,
+      flagsVerified: flagNames.length,
+    },
+    ...(smokeResult ? { smoke: smokeResult } : {}),
+    ...(verboseOutput ? { notCovered: NOT_COVERED } : {}),
+  };
+
+  console.log(verboseOutput ? JSON.stringify(report, null, 2) : JSON.stringify(report));
+
+  if (smokeFailed) {
+    console.error(`Error: ${smokeFailureReason}`);
+    process.exit(1);
+  }
 }
 
 run().catch((err) => {

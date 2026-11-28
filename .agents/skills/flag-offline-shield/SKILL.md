@@ -4,38 +4,37 @@ description: Audits JS/TS repos for missing Flagsmith offline fallbacks and snap
 ---
 # Flag Offline Shield
 
-Resolve `SKILL_DIR` to the folder containing this `SKILL.md`. All paths below are relative to `SKILL_DIR`; this skill has no dependency on any host repo's npm scripts or test runner.
+Resolve `SKILL_DIR` to the folder containing this `SKILL.md`. All paths below are relative to `SKILL_DIR`; no dependency on host npm scripts.
 
 ## Dependencies
 - `@flagsmith/cli` v2+ (`npm install -g @flagsmith/cli`), authenticated (`flagsmith login` or `FLAGSMITH_API_KEY`), bound via `flagsmith init` (`flagsmith.json`)
-- Node.js 18+, `typescript` (for AST scan), `flagsmith` v9+ with `flagsmith/isomorphic` (for outage check)
-- `git`, GitHub CLI `gh` (`gh auth login`), optional `bash` (only for `scripts/audit-flags.sh`)
-- **URL rules:** `FLAGSMITH_API_URL` (`--api-url`) and `FLAGSMITH_SDK_API_URL` (`--sdk-api-url`, used by `eval`) take base URLs **without** `/api/v1/`. The JS SDK `api` option **requires** `/api/v1/`. Optional `FLAGSMITH_OUTAGE_TEST_URL` overrides `http://127.0.0.1:59999/api/v1/`.
+- Node.js 18+, `typescript` (AST scan), `flagsmith` v9+ with `flagsmith/isomorphic` (outage check)
+- `git`, `gh` (`gh auth login`), optional `bash` (standalone `scripts/audit-flags.sh`)
+- **URL rules:** `FLAGSMITH_API_URL` (`--api-url`) and `FLAGSMITH_SDK_API_URL` (`--sdk-api-url`, for `eval`) omit `/api/v1/`. JS SDK `api` requires `/api/v1/`. `verify-outage.mjs` sets `FLAGSMITH_OUTAGE_URL=http://127.0.0.1:59999/api/v1/`.
 
 ## Mandatory Safety & Token Rules
-1. **Low-token CLI only:** Always run `flagsmith flag list --json --jq '[.[] | {name: .feature, enabled, value}]'` (or `scripts/audit-flags.sh` / `scripts/check-drift.mjs`). Never dump unfiltered CLI JSON into context.
-2. **CLI v2.0.0 exit-0 guard:** The npm wrapper can exit `0` on failure. Never redirect `flagsmith eval --js > public/flags.json`. Always use `scripts/audit-flags.sh`, `scripts/check-drift.mjs`, and `scripts/bake-snapshot.mjs`, which validate stdout and exit non-zero on empty/invalid output.
-3. **Two Human Approval Gates:** STOP at Gate #1 (before branching/editing) and Gate #2 (after showing full `git diff` and outage check results, before commit/push/PR).
-4. **Never mutate live flags:** Never run `flag enable`, `flag disable`, or `flag update`.
-5. **`environment document` security warning:** `flagsmith environment document` exports **server-side** data (segments, rules, server-only features). **NEVER commit its output to a public repo** or save it in `public/`. Keep it gitignored/private.
+1. **Low-token CLI:** `scripts/check-drift.mjs` (and `scripts/audit-flags.sh`) run `flagsmith flag list --json --jq '[.[] | {name: .feature, enabled, value}]'` and emit single-line JSON. Never dump unfiltered JSON.
+2. **CLI v2.0.0 exit-0 guard:** The npm wrapper can exit `0` on failure. Never redirect `flagsmith eval --js > public/flags.json`. Always use bundled scripts, which validate stdout and exit non-zero on invalid output.
+3. **Two Human Approval Gates:** STOP at Gate #1 (before branching/editing) and Gate #2 (after showing full `git diff` and verification results, before commit/push/PR).
+4. **Read-only on live flags:** Never run `flag enable`, `flag disable`, `flag update`, or `flag delete`.
+5. **`environment document` warning:** Exports server-side data (segments, rules, server-only flags). **NEVER commit** its output to a public repo or `public/`.
 
 ## Workflow
 
 ### 1. Audit (Live Flags + AST Scan)
 ```bash
-bash "$SKILL_DIR/scripts/audit-flags.sh"
 node "$SKILL_DIR/scripts/check-drift.mjs" --src ./src --snapshot ./public/flags.json
 ```
-`check-drift.mjs` exits non-zero if `--src` is missing or scans 0 files, and outputs compact JSON (`summary`, `drift`, `unprotectedInits`, `unprotectedCalls`). `hasFeature()` / `isFeatureEnabled()` always return a `boolean` (`false` when absent) and are not flagged; pass `{ fallback: true }` only when a feature should fail open.
+Runs `flagsmith flag list --json --jq ...` and scans `--src` in one call. Exits non-zero if `--src` is missing or has 0 files (exit `2` on findings with `--fail-on-findings`). Reports `summary`, `drift`, `unprotectedInits` (`reasons`: `missing_defaults`, `empty_defaults`, `missing_rejection_handler`), `unprotectedCalls`, `uncoveredFlags`, `unknownFlags`, and `unverified`. `hasFeature()`/`isFeatureEnabled()` return `boolean`; pass `{ fallback: true }` only to fail open.
 
 ### 2. Impact Table
-Present a concise table of every `drift` flag, `unprotectedInits` (`file:line`), and `unprotectedCalls` (`file:line`) with the planned fix.
+Show a concise table of `drift`, `unprotectedInits` (`file:line` + `reasons`), `unprotectedCalls` (`file:line`), `uncoveredFlags`, `unknownFlags`, and `unverified` with planned fixes.
 
 ### 3. Human Approval Gate #1 — STOP
 Ask: **"Approve creating branch `chore/flag-offline-shield-sync`, baking `public/flags.json`, patching the listed SDK inits/calls, and running the outage check?"** Wait for explicit approval.
 
 ### 4. Branch
-Verify clean git status (`git status --short`), then:
+Verify clean `git status --short`, then:
 ```bash
 git checkout -b chore/flag-offline-shield-sync
 ```
@@ -46,24 +45,26 @@ node "$SKILL_DIR/scripts/bake-snapshot.mjs" --out ./public/flags.json
 ```
 
 ### 6. Patch Code
-- Wire `defaultFlags` hydrated from `public/flags.json` (or `serverState` / `options.defaultFlags` on `<FlagsmithProvider>`) into every init in `unprotectedInits`, and catch `init()` rejections (`try { await client.init(...); } catch {}`) because `flagsmith/isomorphic` rejects on network failure even with `defaultFlags`.
-- Add neutral inline fallbacks (`?? ""`, `?? 0`, or `{ fallback: ... }`) to every value-reading call in `unprotectedCalls`. Never write no-op `hasFeature(...) ?? false` (use `{ fallback: true }` only to fail open). Never hardcode fake promo copy.
+- Recommended verified pattern: import `snapshot` from `../public/flags.json` and pass `defaultFlags: snapshot.flags` (or a same-file helper mapping `Object.entries(snapshot.flags)` if `IFlags` needs numeric `id`) or `<FlagsmithProvider options={{ defaultFlags: snapshot.flags }}>`. Do not pass `defaultFlags` as an unresolvable parameter or opaque helper (reported as `unverified`).
+- Catch `init()` rejections (`try { await client.init(...); } catch {}` or `.catch(() => {})`), as `flagsmith/isomorphic` rejects on network failure even with `defaultFlags`.
+- Add neutral inline fallbacks (`?? ""`, `?? 0`, or `{ fallback: ... }`) to `unprotectedCalls`. Never write no-op `hasFeature(...) ?? false` or fake promo copy.
+- Ensure all literal flags read in code exist in `public/flags.json`, and resolve any `unknownFlags` or `unverified` items.
 
 ### 7. Verify Outage Resilience & Re-Audit
 ```bash
-node "$SKILL_DIR/scripts/verify-outage.mjs" --src ./src --snapshot ./public/flags.json
-node "$SKILL_DIR/scripts/check-drift.mjs" --src ./src --snapshot ./public/flags.json
+node "$SKILL_DIR/scripts/verify-outage.mjs" --src ./src --snapshot ./public/flags.json --smoke "npm test"
+node "$SKILL_DIR/scripts/check-drift.mjs" --src ./src --snapshot ./public/flags.json --fail-on-findings
 ```
-Confirm `verify-outage.mjs` returns `passed: true` (0 unprotected inits in `--src`, `SERVER` mock control, `DEFAULT_FLAGS` failover) and `check-drift.mjs` reports `drifted: 0`, `unprotectedInits: 0`, `unprotectedCalls: 0`. Also run the target repo's own typecheck and outage smoke tests if present.
+Omit `--smoke` if the repo has no outage test (`appRuntime: "not_run"`; `--verbose` adds `notCovered`). When `--smoke` runs, the report includes `smoke.command`; `appRuntime: "passed"` only means that command exited `0` (pair `--src` with a test exercising the same code against `FLAGSMITH_OUTAGE_URL`). Confirm `passed: true`, `sdkAndStaticCheck: "passed"`, and `check-drift.mjs --fail-on-findings` exits `0`. Run typecheck/lint if present.
 
 ### 8. Show Full Diff & Results
-Show `git status --short`, full `git diff`, and the exact outputs/exit codes from Step 7.
+Show `git status --short`, full `git diff`, and exact outputs/exit codes from Step 7.
 
 ### 9. Human Approval Gate #2 — STOP
 Ask: **"Approve committing these changes, pushing `chore/flag-offline-shield-sync`, and opening the GitHub PR?"** Wait for explicit approval.
 
 ### 10. Commit, Push & Open PR
-Write `pr-body.md` with real Markdown newlines (include before/after audit counts, real `verify-outage.mjs` output, and any app smoke test output). Never append `|| true` to `gh pr create`:
+Write `pr-body.md` with before/after counts, `verify-outage.mjs` output (`sdkAndStaticCheck`/`appRuntime`), and smoke output. Never append `|| true` to `gh pr create`:
 ```bash
 git add public/flags.json <patched-files>
 git commit -m "chore(flags): sync offline defaults and harden Flagsmith fallbacks"
@@ -73,5 +74,5 @@ rm -f pr-body.md
 ```
 
 ## On-Demand References
-- Command failures & rollback steps: read `references/troubleshooting-and-rollback.md`
-- AST scanner & outage check boundaries: read `references/scanner-limitations.md`
+- Command failures & rollback: `references/troubleshooting-and-rollback.md`
+- Scanner & outage boundaries: `references/scanner-limitations.md`

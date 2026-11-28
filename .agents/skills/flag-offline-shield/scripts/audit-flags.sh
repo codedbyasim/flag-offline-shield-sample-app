@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Token-efficient Flagsmith CLI audit script.
-# Fetches ONLY {name, enabled, value} via --json --jq to minimize LLM context tokens.
+# Fetches ONLY {name, enabled, value} via --json --jq and emits compact single-line JSON.
 # Supports custom Flagsmith Management API base URLs via FLAGSMITH_API_URL (without /api/v1/).
 
 if ! command -v flagsmith >/dev/null 2>&1; then
@@ -34,7 +34,7 @@ STDERR_FILE="$(mktemp)"
 trap 'rm -f "$STDERR_FILE"' EXIT
 
 set +e
-RAW_OUT="$(flagsmith flag list "${EXTRA_ARGS[@]}" --json --jq "$JQ_FILTER" 2>"$STDERR_FILE")"
+RAW_OUT="$(flagsmith flag list ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --json --jq "$JQ_FILTER" 2>"$STDERR_FILE")"
 CLI_EXIT=$?
 set -e
 
@@ -57,7 +57,7 @@ if [ -z "$TRIMMED" ]; then
 fi
 
 if command -v node >/dev/null 2>&1; then
-  if ! printf '%s' "$RAW_OUT" | node -e '
+  COMPACT_OUT="$(printf '%s' "$RAW_OUT" | node -e '
     const fs = require("node:fs");
     const raw = fs.readFileSync(0, "utf8").trim();
     if (!raw) process.exit(2);
@@ -69,19 +69,24 @@ if command -v node >/dev/null 2>&1; then
         process.exit(5);
       }
     }
-  '; then
+    process.stdout.write(JSON.stringify(parsed));
+  ')" || {
     echo "Error: flagsmith flag list returned invalid or non-array JSON." >&2
     [ -n "$STDERR_OUT" ] && echo "$STDERR_OUT" >&2
     echo "Output was: $RAW_OUT" >&2
     exit 1
-  fi
+  }
+  printf '%s\n' "$COMPACT_OUT"
+  exit 0
 elif command -v jq >/dev/null 2>&1; then
-  if ! printf '%s' "$RAW_OUT" | jq -e 'type == "array" and all(.[]; type == "object" and (.name | type == "string") and (.enabled | type == "boolean"))' >/dev/null 2>&1; then
+  COMPACT_OUT="$(printf '%s' "$RAW_OUT" | jq -c 'if (type == "array" and all(.[]; type == "object" and (.name | type == "string") and (.enabled | type == "boolean"))) then . else error("invalid") end' 2>/dev/null)" || {
     echo "Error: flagsmith flag list returned invalid or non-array JSON." >&2
     [ -n "$STDERR_OUT" ] && echo "$STDERR_OUT" >&2
     echo "Output was: $RAW_OUT" >&2
     exit 1
-  fi
+  }
+  printf '%s\n' "$COMPACT_OUT"
+  exit 0
 fi
 
 printf '%s\n' "$RAW_OUT"
